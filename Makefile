@@ -27,8 +27,9 @@ fmt: ## Format source code
 run: ## Start the development server
 	cargo run
 
-docker-up: ## Start the full stack via Docker Compose
+docker-up: ## Start the full stack via Docker Compose and wait for app to be healthy
 	docker-compose up --build -d
+	docker-compose wait app
 
 docker-down: ## Tear down the Docker Compose stack
 	docker-compose down
@@ -41,3 +42,34 @@ migrate-down: ## Rollback the most recent migration
 
 clean: ## Remove build artifacts
 	cargo clean
+	rm -f openapi.json
+
+generate-sdk: ## Generate TypeScript and Python SDKs from OpenAPI spec
+	cargo run --bin gen_openapi > openapi.json
+	# Generate TypeScript SDK
+	npx @openapitools/openapi-generator-cli generate \
+		-i openapi.json \
+		-g typescript-fetch \
+		-o sdk/typescript \
+		--additional-properties=typescriptThreePlus=true,supportsES6=true
+	# Generate Python SDK
+	npx @openapitools/openapi-generator-cli generate \
+		-i openapi.json \
+		-g python \
+		-o sdk/python \
+		--additional-properties=library=httpx
+
+vacuum: ## Run VACUUM ANALYZE on the events table
+	@if [ -z "$$DATABASE_URL" ]; then echo "DATABASE_URL is not set"; exit 1; fi
+	psql "$$DATABASE_URL" -c "VACUUM ANALYZE events;"
+
+.PHONY: run-zipkin zipkin-up zipkin-down
+run-zipkin: ## Run with Zipkin tracing
+	ZIPKIN_ENDPOINT=$${ZIPKIN_ENDPOINT:-http://localhost:9411/api/v2/spans} \
+	cargo run --features zipkin
+
+zipkin-up: ## Start Zipkin container
+	docker run -d -p 9411:9411 --name zipkin openzipkin/zipkin
+
+zipkin-down: ## Stop Zipkin container
+	docker stop zipkin || true && docker rm zipkin || true

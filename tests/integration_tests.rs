@@ -13,7 +13,19 @@ fn make_router(pool: PgPool, api_key: Option<String>) -> axum::Router {
     health_state.update_last_poll();
     let indexer_state = Arc::new(IndexerState::new());
     let prometheus_handle = init_metrics();
-    create_router(pool, api_key, &[], 60, health_state, indexer_state, prometheus_handle, 1_048_576)
+    let api_keys = api_key.into_iter().collect();
+    let config = soroban_pulse::config::Config::default();
+    create_router(
+        pool,
+        api_keys,
+        &[],
+        60,
+        health_state,
+        indexer_state,
+        prometheus_handle,
+        15000,
+        config,
+    )
 }
 
 // --- Health ---
@@ -23,7 +35,12 @@ async fn health_ready_with_live_db_returns_200(pool: PgPool) {
     let app = make_router(pool, None);
 
     let resp = app
-        .oneshot(Request::builder().uri("/healthz/ready").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/healthz/ready")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
 
@@ -42,7 +59,12 @@ async fn request_without_api_key_returns_401_when_key_configured(pool: PgPool) {
     let app = make_router(pool, Some("secret".to_string()));
 
     let resp = app
-        .oneshot(Request::builder().uri("/v1/events").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/v1/events")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
 
@@ -90,7 +112,12 @@ async fn health_endpoint_bypasses_auth(pool: PgPool) {
     let app = make_router(pool, Some("secret".to_string()));
 
     let resp = app
-        .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
 
@@ -104,7 +131,12 @@ async fn unversioned_events_route_returns_deprecation_header(pool: PgPool) {
     let app = make_router(pool, None);
 
     let resp = app
-        .oneshot(Request::builder().uri("/events").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/events")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
 
@@ -126,13 +158,23 @@ async fn metrics_endpoint_returns_prometheus_text(pool: PgPool) {
     let app = make_router(pool, None);
 
     let resp = app
-        .oneshot(Request::builder().uri("/metrics").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
 
     assert_eq!(resp.status(), StatusCode::OK);
-    let body =
-        String::from_utf8(to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
+    let body = String::from_utf8(
+        to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
     assert!(body.contains("soroban_pulse"));
 }
 
@@ -238,4 +280,378 @@ async fn contract_without_ledger_range_returns_all_events(pool: PgPool) {
     assert_eq!(body["data"].as_array().unwrap().len(), 3);
     assert!(body.get("from_ledger").is_none());
     assert!(body.get("to_ledger").is_none());
+}
+
+// --- SSE Streaming ---
+
+#[sqlx::test(migrations = "./migrations")]
+async fn sse_contract_stream_invalid_contract_id_returns_400(pool: PgPool) {
+    let app = make_router(pool, None);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/events/contract/INVALID/stream")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn sse_contract_stream_establishes_successfully(pool: PgPool) {
+    let contract_id = "C1234567890123456789012345678901234567890123456789012345";
+    let app = make_router(pool, None);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/v1/events/contract/{}/stream", contract_id))
+                .header(header::ACCEPT, "text/event-stream")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get(header::CONTENT_TYPE).unwrap(),
+        "text/event-stream"
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn sse_deprecated_contract_stream_unversioned_alias_works(pool: PgPool) {
+    let contract_id = "C1234567890123456789012345678901234567890123456789012345";
+    let app = make_router(pool, None);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/events/contract/{}/stream", contract_id))
+                .header(header::ACCEPT, "text/event-stream")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers().get("Deprecation").unwrap(), "true");
+}
+
+// --- Issue #186: sort parameter ---
+
+async fn insert_events_with_ledgers(pool: &PgPool, ledgers: &[i64]) {
+    for (i, &ledger) in ledgers.iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO events (contract_id, event_type, tx_hash, ledger, timestamp, event_data)
+             VALUES ($1, $2, $3, $4, NOW(), $5)",
+        )
+        .bind(format!("C{:0>55}", i))
+        .bind("contract")
+        .bind(format!("{:0>63}{}", i, ledger))
+        .bind(ledger)
+        .bind(serde_json::json!({}))
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn get_events_sort_desc_returns_newest_first(pool: PgPool) {
+    insert_events_with_ledgers(&pool, &[100, 200, 300]).await;
+
+    let app = make_router(pool, None);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/events?sort=desc")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let data = body["data"].as_array().unwrap();
+    assert_eq!(data.len(), 3);
+    assert!(data[0]["ledger"].as_i64().unwrap() >= data[1]["ledger"].as_i64().unwrap());
+    assert!(data[1]["ledger"].as_i64().unwrap() >= data[2]["ledger"].as_i64().unwrap());
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn get_events_sort_asc_returns_oldest_first(pool: PgPool) {
+    insert_events_with_ledgers(&pool, &[100, 200, 300]).await;
+
+    let app = make_router(pool, None);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/events?sort=asc")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let data = body["data"].as_array().unwrap();
+    assert_eq!(data.len(), 3);
+    assert!(data[0]["ledger"].as_i64().unwrap() <= data[1]["ledger"].as_i64().unwrap());
+    assert!(data[1]["ledger"].as_i64().unwrap() <= data[2]["ledger"].as_i64().unwrap());
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn get_events_default_sort_is_desc(pool: PgPool) {
+    insert_events_with_ledgers(&pool, &[100, 200, 300]).await;
+
+    let app = make_router(pool, None);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/events")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let data = body["data"].as_array().unwrap();
+    // Default is desc — first element should have the highest ledger
+    assert!(
+        data[0]["ledger"].as_i64().unwrap() >= data[data.len() - 1]["ledger"].as_i64().unwrap()
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn get_events_invalid_sort_returns_400(pool: PgPool) {
+    let app = make_router(pool, None);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/events?sort=random")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn get_events_by_contract_sort_asc_returns_oldest_first(pool: PgPool) {
+    let contract_id = "C1234567890123456789012345678901234567890123456789012345";
+    insert_contract_events(&pool, contract_id, &[100, 200, 300]).await;
+
+    let app = make_router(pool, None);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/v1/events/contract/{}?sort=asc", contract_id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let data = body["data"].as_array().unwrap();
+    assert_eq!(data.len(), 3);
+    assert!(data[0]["ledger"].as_i64().unwrap() <= data[1]["ledger"].as_i64().unwrap());
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn get_events_by_contract_sort_desc_returns_newest_first(pool: PgPool) {
+    let contract_id = "C1234567890123456789012345678901234567890123456789012345";
+    insert_contract_events(&pool, contract_id, &[100, 200, 300]).await;
+
+    let app = make_router(pool, None);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/v1/events/contract/{}?sort=desc", contract_id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let data = body["data"].as_array().unwrap();
+    assert_eq!(data.len(), 3);
+    assert!(data[0]["ledger"].as_i64().unwrap() >= data[1]["ledger"].as_i64().unwrap());
+}
+
+// --- GET /v1/events/stats ---
+
+async fn insert_stats_seed_data(pool: &PgPool) {
+    // 3 contract events for contract A
+    let contract_a = "CA23456789012345678901234567890123456789012345678901234567";
+    // 2 contract events for contract B
+    let contract_b = "CB23456789012345678901234567890123456789012345678901234567";
+
+    for i in 0..3i64 {
+        sqlx::query(
+            "INSERT INTO events (contract_id, event_type, tx_hash, ledger, timestamp, event_data)
+             VALUES ($1, 'contract', $2, $3, NOW(), '{}'::jsonb)",
+        )
+        .bind(contract_a)
+        .bind(format!("{:0>63}{}", i, "a"))
+        .bind(100 + i)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+    for i in 0..2i64 {
+        sqlx::query(
+            "INSERT INTO events (contract_id, event_type, tx_hash, ledger, timestamp, event_data)
+             VALUES ($1, 'diagnostic', $2, $3, NOW(), '{}'::jsonb)",
+        )
+        .bind(contract_b)
+        .bind(format!("{:0>63}{}", i, "b"))
+        .bind(200 + i)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn stats_returns_200_with_correct_totals(pool: PgPool) {
+    insert_stats_seed_data(&pool).await;
+    let app = make_router(pool, None);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/events/stats")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+
+    assert_eq!(body["total_events"], 5);
+    assert_eq!(body["events_by_type"]["contract"], 3);
+    assert_eq!(body["events_by_type"]["diagnostic"], 2);
+    assert_eq!(body["events_by_type"]["system"], 0);
+    assert!(body["computed_at"].is_string());
+    assert_eq!(body["min_ledger"], 100);
+    assert_eq!(body["max_ledger"], 201);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn stats_top_contracts_ordered_by_count(pool: PgPool) {
+    insert_stats_seed_data(&pool).await;
+    let app = make_router(pool, None);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/events/stats")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+
+    let top = body["top_contracts"].as_array().unwrap();
+    assert_eq!(top.len(), 2);
+    // Contract A has 3 events, contract B has 2 — A should be first.
+    assert_eq!(top[0]["event_count"], 3);
+    assert_eq!(top[1]["event_count"], 2);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn stats_returns_cache_control_header(pool: PgPool) {
+    let app = make_router(pool, None);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/events/stats")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let cc = resp
+        .headers()
+        .get("cache-control")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(
+        cc.contains("max-age=60"),
+        "expected max-age=60 in Cache-Control, got: {cc}"
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn stats_empty_db_returns_zeros(pool: PgPool) {
+    let app = make_router(pool, None);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/events/stats")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+
+    assert_eq!(body["total_events"], 0);
+    assert!(body["min_ledger"].is_null());
+    assert!(body["max_ledger"].is_null());
+    assert_eq!(body["top_contracts"].as_array().unwrap().len(), 0);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn stats_requires_auth_when_key_configured(pool: PgPool) {
+    let app = make_router(pool, Some("secret".to_string()));
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/events/stats")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }

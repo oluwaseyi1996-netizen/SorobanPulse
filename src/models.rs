@@ -5,7 +5,9 @@ use std::fmt;
 use std::str::FromStr;
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type, utoipa::ToSchema)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type, utoipa::ToSchema,
+)]
 #[sqlx(type_name = "text", rename_all = "lowercase")]
 #[serde(rename_all = "lowercase")]
 pub enum EventType {
@@ -17,9 +19,9 @@ pub enum EventType {
 impl fmt::Display for EventType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            EventType::Contract   => write!(f, "contract"),
+            EventType::Contract => write!(f, "contract"),
             EventType::Diagnostic => write!(f, "diagnostic"),
-            EventType::System     => write!(f, "system"),
+            EventType::System => write!(f, "system"),
         }
     }
 }
@@ -28,9 +30,9 @@ impl FromStr for EventType {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "contract"   => Ok(EventType::Contract),
+            "contract" => Ok(EventType::Contract),
             "diagnostic" => Ok(EventType::Diagnostic),
-            "system"     => Ok(EventType::System),
+            "system" => Ok(EventType::System),
             other => Err(format!("unknown event type: {other}")),
         }
     }
@@ -45,7 +47,20 @@ pub struct Event {
     pub ledger: i64,
     pub timestamp: DateTime<Utc>,
     pub event_data: Value,
+    pub event_data_normalized: Option<Value>,
+    #[sqlx(default)]
+    pub event_data_decoded: Option<Value>,
+    #[sqlx(default)]
+    pub ledger_hash: Option<String>,
+    #[sqlx(default)]
+    pub in_successful_call: bool,
     pub created_at: DateTime<Utc>,
+    /// Schema version of the Soroban protocol used when this event was indexed.
+    #[sqlx(default)]
+    pub schema_version: i32,
+    /// Whether this event has been anonymized for GDPR compliance.
+    #[sqlx(default)]
+    pub anonymized: bool,
     #[sqlx(default)]
     #[serde(skip)]
     pub total_count: i64,
@@ -57,10 +72,33 @@ pub struct PaginationParams {
     pub limit: Option<i64>,
     pub exact_count: Option<bool>,
     pub fields: Option<String>,
+    pub contract_id: Option<String>,
     pub event_type: Option<EventType>,
     pub from_ledger: Option<i64>,
     pub to_ledger: Option<i64>,
     pub cursor: Option<String>,
+    pub sort: Option<SortOrder>,
+    pub in_successful_call: Option<bool>,
+    /// Filter by the first topic symbol (uses topic_0_sym generated column index).
+    pub topic_sym: Option<String>,
+}
+
+/// Sort order for event list endpoints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum SortOrder {
+    Asc,
+    Desc,
+}
+
+impl SortOrder {
+    /// Returns the SQL ORDER BY direction string.
+    pub fn as_sql(&self) -> &'static str {
+        match self {
+            SortOrder::Asc => "ASC",
+            SortOrder::Desc => "DESC",
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
@@ -88,6 +126,58 @@ impl SearchParams {
 #[derive(Debug, Deserialize)]
 pub struct StreamParams {
     pub contract_id: Option<String>,
+    pub fields: Option<String>,
+}
+
+/// Query parameters for the multi-contract SSE stream endpoint.
+#[derive(Debug, Deserialize)]
+pub struct MultiStreamParams {
+    /// Comma-separated list of contract IDs to subscribe to.
+    pub contract_ids: Option<String>,
+}
+
+/// Standard error response body returned by all error responses.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct ErrorResponse {
+    /// Human-readable error description.
+    pub error: String,
+    /// Machine-readable error code.
+    pub code: String,
+}
+
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct ExportParams {
+    pub event_type: Option<EventType>,
+    pub from_ledger: Option<i64>,
+    pub to_ledger: Option<i64>,
+    pub contract_id: Option<String>,
+    /// Output format: "csv" (default) or "parquet"
+    pub format: Option<String>,
+}
+
+/// Query parameters for GET /v1/events/diff
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct DiffParams {
+    pub from_ledger: i64,
+    pub to_ledger: i64,
+}
+
+/// Per-contract event counts in a diff response.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct ContractDiff {
+    pub contract_id: String,
+    /// Event counts keyed by event type name.
+    pub event_counts: std::collections::HashMap<String, i64>,
+    /// Total events emitted by this contract in the range.
+    pub total: i64,
+}
+
+/// Response body for GET /v1/events/diff
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct DiffResponse {
+    pub from_ledger: i64,
+    pub to_ledger: i64,
+    pub contracts: Vec<ContractDiff>,
 }
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
@@ -96,11 +186,46 @@ pub struct ReplayRequest {
     pub to_ledger: u64,
 }
 
+/// Request body for the batch tx-hash lookup endpoint.
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct BatchTxRequest {
+    /// List of transaction hashes to look up (max 100).
+    pub hashes: Vec<String>,
+}
+
 #[derive(Debug, Serialize, sqlx::FromRow, utoipa::ToSchema)]
 pub struct ContractSummary {
     pub contract_id: String,
     pub event_count: i64,
     pub latest_ledger: i64,
+}
+
+/// Aggregate statistics for indexed events.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct EventStats {
+    /// Total number of indexed events.
+    pub total_events: i64,
+    /// Events indexed in the last 24 hours.
+    pub events_last_24h: i64,
+    /// Events indexed in the last 7 days.
+    pub events_last_7d: i64,
+    /// Top 10 most active contracts by event count.
+    pub top_contracts: Vec<ContractStatEntry>,
+    /// Event count broken down by type.
+    pub events_by_type: std::collections::HashMap<String, i64>,
+    /// Minimum ledger sequence number in the dataset.
+    pub min_ledger: Option<i64>,
+    /// Maximum ledger sequence number in the dataset.
+    pub max_ledger: Option<i64>,
+    /// Timestamp when these statistics were computed.
+    pub computed_at: DateTime<Utc>,
+}
+
+/// A single entry in the top-contracts list.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct ContractStatEntry {
+    pub contract_id: String,
+    pub event_count: i64,
 }
 
 impl PaginationParams {
@@ -112,7 +237,13 @@ impl PaginationParams {
         "ledger",
         "timestamp",
         "event_data",
+        "event_data_normalized",
+        "event_data_decoded",
+        "ledger_hash",
+        "in_successful_call",
         "created_at",
+        "schema_version",
+        "anonymized",
     ];
 
     pub fn columns(&self) -> Result<Vec<&str>, (Vec<String>, Vec<&'static str>)> {
@@ -125,7 +256,7 @@ impl PaginationParams {
                     .map(|s| s.to_string())
                     .collect();
                 if !unknown.is_empty() {
-                    return Err((unknown, Self::ALLOWED_FIELDS));
+                    return Err((unknown, Self::ALLOWED_FIELDS.to_vec()));
                 }
                 Ok(requested)
             }
@@ -169,6 +300,9 @@ pub struct GetEventsResult {
     pub latest_ledger: u64,
     #[serde(rename = "cursor")]
     pub rpc_cursor: Option<String>,
+    /// Soroban protocol version returned by the RPC (used as schema_version).
+    #[serde(rename = "latestLedgerCloseTime", default)]
+    pub protocol_version: Option<u32>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -182,8 +316,16 @@ pub struct SorobanEvent {
     pub ledger: u64,
     #[serde(rename = "ledgerClosedAt")]
     pub ledger_closed_at: String,
+    #[serde(rename = "ledgerHash", default)]
+    pub ledger_hash: Option<String>,
+    #[serde(rename = "inSuccessfulContractCall", default = "default_true")]
+    pub in_successful_call: bool,
     pub value: Value,
     pub topic: Option<Vec<Value>>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[cfg(test)]
@@ -196,10 +338,14 @@ mod tests {
             limit,
             exact_count: None,
             fields: None,
+            contract_id: None,
             event_type: None,
             from_ledger: None,
             to_ledger: None,
             cursor: None,
+            sort: None,
+            in_successful_call: None,
+            contract_id: None,
         }
     }
 
@@ -245,9 +391,15 @@ mod tests {
         assert_eq!(result.rpc_cursor.as_deref(), Some("1234567-0"));
         assert_eq!(result.events.len(), 1);
         let ev = &result.events[0];
-        assert_eq!(ev.contract_id, "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM");
+        assert_eq!(
+            ev.contract_id,
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
+        );
         assert_eq!(ev.event_type, "contract");
-        assert_eq!(ev.tx_hash, "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2");
+        assert_eq!(
+            ev.tx_hash,
+            "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
+        );
         assert_eq!(ev.ledger, 1234567);
         assert_eq!(ev.ledger_closed_at, "2026-03-14T00:00:00Z");
         assert!(ev.topic.is_some());
@@ -260,7 +412,10 @@ mod tests {
         assert!(resp.result.is_none());
         let err = resp.error.unwrap();
         assert_eq!(err.code, -32600);
-        assert_eq!(err.message, "startLedger must be within the ledger retention window");
+        assert_eq!(
+            err.message,
+            "startLedger must be within the ledger retention window"
+        );
     }
 
     #[test]

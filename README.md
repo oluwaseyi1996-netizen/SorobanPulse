@@ -25,6 +25,8 @@ migrations/
 └── 20260314000000_create_events.sql
 ```
 
+See [docs/schema.md](docs/schema.md) for a detailed description of the database schema, indexes, constraints, and an ER diagram.
+
 ## Setup
 
 ### 1. Prerequisites
@@ -56,6 +58,10 @@ Open the newly created `.env` file in your editor and fill in your own real valu
 | `RUST_LOG_FORMAT` | Log output format (`text` or `json`) | `text`                                   |
 | `INDEXER_LAG_WARN_THRESHOLD` | Indexer lag warning threshold (ledgers) | `100`                                   |
 | `HEALTH_CHECK_TIMEOUT_MS`   | Timeout for the health check DB ping     | `2000`                                  |
+| `INDEX_CHECK_INTERVAL_HOURS` | How often the index usage monitor runs (hours) | `24`                             |
+| `RATE_LIMIT_PER_MINUTE` | Maximum requests per IP per minute (0 = unlimited) | `60`                         |
+| `SSE_KEEPALIVE_SECS` | SSE keep-alive ping interval in seconds (1–60) | `15`                              |
+| `INDEXER_LOCK_RETRY_SECS` | How often standby replicas retry the advisory lock | `30`                    |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | OpenTelemetry OTLP collector endpoint (when built with `otel` feature) | `http://localhost:4317` |
 
 > **Note on Authentication:** You can enable optional API key authentication by setting the `API_KEY` environment variable. When set, all requests (except `/health` and `/healthz/*` endpoints) will require either an `Authorization: Bearer <API_KEY>` or an `X-Api-Key: <API_KEY>` header. If `API_KEY` is unset or omitted from your configuration, authentication is bypassed and all requests pass through.
@@ -162,12 +168,50 @@ Server-Sent Events stream. New events are pushed to connected clients within one
 - Each SSE message is a JSON-serialised event object.
 - The connection is cleaned up automatically when the client disconnects.
 
+#### Keep-alive and reconnection
+
+The server emits a named `event: ping` every `SSE_KEEPALIVE_SECS` seconds (default: 15) so that reverse proxies and browsers do not close idle connections. The ping data is an RFC 3339 timestamp.
+
+When the indexer shuts down, the server emits a final `event: close` before terminating the stream. Clients should treat this as a signal to reconnect.
+
+The browser `EventSource` API reconnects automatically using the `Last-Event-ID` header. The server replays any events missed since that ID on reconnect.
+
+```javascript
+const es = new EventSource('/v1/events/stream');
+
+es.addEventListener('ping', (e) => {
+  // stream is alive, timestamp in e.data
+});
+
+es.addEventListener('close', () => {
+  // server is shutting down — EventSource will reconnect automatically
+});
+
+es.onmessage = (e) => {
+  const event = JSON.parse(e.data);
+  console.log(event);
+};
+```
+
 ```bash
 # Subscribe to all events
 curl -N http://localhost:3000/v1/events/stream
 
 # Subscribe to a specific contract
 curl -N "http://localhost:3000/v1/events/stream?contract_id=CABC..."
+```
+
+### `GET /v1/events/stream/multi?contract_ids=C1,C2,C3`
+Multiplexed SSE stream for multiple contracts over a single connection.
+
+- **`contract_ids`**: Required. Comma-separated list of contract IDs to subscribe to.
+- Each ID is validated; any invalid ID returns `400 Bad Request` with the list of invalid IDs.
+- An empty `contract_ids` parameter returns `400 Bad Request`.
+- Returns `Content-Type: text/event-stream`.
+
+```bash
+# Subscribe to two contracts simultaneously
+curl -N "http://localhost:3000/v1/events/stream/multi?contract_ids=CABC...,CDEF..."
 ```
 
 ### Deprecated unversioned routes
@@ -188,6 +232,20 @@ Migrate to `/v1/` paths at your earliest convenience.
 3. New events are inserted with `ON CONFLICT DO NOTHING` to avoid duplicates.
 4. The Axum HTTP server runs concurrently, serving queries against the indexed data.
 
+### Multi-replica advisory lock
+
+When running multiple replicas, only one should index at a time. The indexer uses a Postgres session-level advisory lock (`pg_try_advisory_lock`) to elect a single leader:
+
+- On startup each replica attempts to acquire the lock.
+- The replica that succeeds becomes the **active indexer** and starts polling.
+- Replicas that fail enter a **standby retry loop**, re-attempting every `INDEXER_LOCK_RETRY_SECS` seconds (default: 30).
+- When the leader's DB connection is dropped (crash, restart, network partition), Postgres automatically releases the lock. A standby replica will acquire it within one retry interval and promote to leader with no manual intervention.
+- The `soroban_pulse_indexer_is_leader` gauge is `1` on the active replica and `0` on standbys, making it easy to alert on split-brain or leaderless scenarios.
+
+| Variable | Description | Default |
+|---|---|---|
+| `INDEXER_LOCK_RETRY_SECS` | How often standby replicas retry the advisory lock | `30` |
+
 ## Notes
 
 - The indexer polls every 5 seconds when no new ledgers are available, and 10 seconds on error.
@@ -198,6 +256,19 @@ Migrate to `/v1/` paths at your earliest convenience.
 
 Prometheus alerting rules covering all key SLOs are defined in [`docs/alerts.yml`](docs/alerts.yml).
 
+### Grafana Dashboard
+
+A pre-built Grafana dashboard is available at [`docs/grafana-dashboard.json`](docs/grafana-dashboard.json). It covers all key operational metrics with alert thresholds matching `docs/alerts.yml`.
+
+**To import:**
+
+1. In Grafana, go to **Dashboards → Import**
+2. Click **Upload JSON file** and select `docs/grafana-dashboard.json`
+3. Select your Prometheus datasource from the dropdown
+4. Click **Import**
+
+The dashboard includes template variables for the Prometheus datasource and instance label, so it works in any Grafana instance without modification.
+
 ### Metrics
 
 The service exposes Prometheus-compatible metrics at `GET /metrics`:
@@ -206,11 +277,17 @@ The service exposes Prometheus-compatible metrics at `GET /metrics`:
 - `soroban_pulse_indexer_current_ledger` - Current ledger being processed
 - `soroban_pulse_indexer_latest_ledger` - Latest ledger from RPC
 - `soroban_pulse_indexer_lag_ledgers` - Lag between latest and current ledger
+- `soroban_pulse_indexer_is_leader` - 1 if this replica holds the advisory lock (active indexer), 0 if standby
 - `soroban_pulse_rpc_errors_total` - Total RPC errors
+- `soroban_pulse_webhook_failures_total` - Total webhook delivery failures (all retries exhausted)
+- `soroban_pulse_email_failures_total` - Total email notification failures
 - `soroban_pulse_http_request_duration_seconds` - HTTP request duration by route, method, and status
+- `soroban_pulse_rate_limit_rejected_total` - Total requests rejected by rate limiting (429 Too Many Requests)
+- `soroban_pulse_sse_active_connections` - Number of currently active SSE connections
 - `soroban_pulse_db_pool_size` - Current number of open database connections
 - `soroban_pulse_db_pool_idle` - Number of idle database connections
 - `soroban_pulse_db_pool_max` - Configured maximum database connections
+- `soroban_pulse_process_memory_bytes` - Process RSS memory in bytes (Linux only, updated every 30 seconds)
 
 ### Distributed Tracing
 
@@ -256,6 +333,51 @@ cargo bench
 ```
 
 Results are written to `target/criterion/`. Run this after changes to `PaginationParams` to catch regressions. The CI pipeline runs `cargo bench` as a non-blocking step so historical results are preserved in the job logs.
+
+#### Database Query Benchmarks
+
+A second benchmark suite in `benches/db_queries.rs` measures real PostgreSQL query performance against a pre-seeded dataset of 10,000 events. It covers the four primary query scenarios:
+
+| Benchmark | Query |
+|---|---|
+| `db/get_events_no_filter` | `GET /v1/events` — no filters, page 1 |
+| `db/get_events_ledger_range` | `GET /v1/events?from_ledger=200&to_ledger=400` |
+| `db/get_events_exact_count` | `GET /v1/events?exact_count=true` — `COUNT(*)` |
+| `db/get_events_by_contract` | `GET /v1/events/contract/:id` — 500-event contract |
+
+```bash
+# Requires DATABASE_URL to point at a running Postgres instance
+cargo bench --bench db_queries
+```
+
+##### Baseline Numbers (10,000-event dataset, local Postgres)
+
+| Benchmark | Mean | p99 |
+|---|---|---|
+| `db/get_events_no_filter` | ~1.5 ms | ~2.5 ms |
+| `db/get_events_ledger_range` | ~1.8 ms | ~3.0 ms |
+| `db/get_events_exact_count` | ~3.5 ms | ~6.0 ms |
+| `db/get_events_by_contract` | ~1.2 ms | ~2.0 ms |
+
+> These numbers are indicative baselines measured on a local development machine. Your results will vary based on hardware, Postgres configuration, and dataset size. Use them as a regression reference — a significant increase after a schema or query change warrants investigation.
+
+#### Compression Benchmarks
+
+A benchmark in `benches/compression.rs` measures gzip compression time and ratio for typical event list responses at 10, 100, and 1000 events.
+
+```bash
+cargo bench --bench compression
+```
+
+##### Baseline Numbers (synthetic event JSON, local machine)
+
+| Events | Uncompressed | Compressed | Ratio | Compression time |
+|--------|-------------|------------|-------|------------------|
+| 10     | ~1.5 KB     | ~0.6 KB    | ~2.5x | ~5 µs            |
+| 100    | ~15 KB      | ~2.5 KB    | ~6x   | ~30 µs           |
+| 1000   | ~150 KB     | ~12 KB     | ~12x  | ~250 µs          |
+
+**Recommendation:** The default zlib level 6 (tower-http's `CompressionLayer` default) provides a good balance between CPU overhead and bandwidth savings. For responses of 100+ events the compression ratio exceeds 6x, making it strongly worthwhile. For very small responses (< 10 events, < 1 KB) the overhead is negligible either way. No adjustment to the default compression level is recommended.
 
 ### Load Testing
 
